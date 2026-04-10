@@ -537,6 +537,7 @@ async def screen_analyze(
         ollama_url = "http://127.0.0.1:11434"
         try:
             from pilot.config import PilotConfig
+
             ollama_url = PilotConfig.load().model.ollama_base_url or ollama_url
         except Exception:
             pass
@@ -572,9 +573,7 @@ async def screen_analyze(
     )
 
 
-async def _gemini_vision(
-    api_key: str, b64_image: str, prompt: str, configured_model: str | None = None
-) -> str | None:
+async def _gemini_vision(api_key: str, b64_image: str, prompt: str, configured_model: str | None = None) -> str | None:
     """Call Gemini Vision API with model fallback and retry on 503/429."""
     import httpx
 
@@ -589,17 +588,20 @@ async def _gemini_vision(
     base_url = "https://generativelanguage.googleapis.com/v1beta"
     try:
         from pilot.models.cloud import PROVIDER_ENDPOINTS
+
         base_url = PROVIDER_ENDPOINTS.get("gemini", base_url)
     except Exception:
         pass
 
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inlineData": {"mimeType": "image/png", "data": b64_image}},
-            ]
-        }],
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": "image/png", "data": b64_image}},
+                ]
+            }
+        ],
         "generationConfig": {"temperature": 0.1},
     }
 
@@ -620,10 +622,13 @@ async def _gemini_vision(
                         logger.warning("Gemini returned empty candidates for %s", model_name)
                         break  # Try next model
                     elif resp.status_code in (429, 503):
-                        wait = 2.0 * (2 ** attempt)
+                        wait = 2.0 * (2**attempt)
                         logger.info(
                             "Gemini %s returned %d, retrying in %.1fs (attempt %d/3)",
-                            model_name, resp.status_code, wait, attempt + 1,
+                            model_name,
+                            resp.status_code,
+                            wait,
+                            attempt + 1,
                         )
                         await asyncio.sleep(wait)
                         continue
@@ -636,9 +641,7 @@ async def _gemini_vision(
     return None
 
 
-async def _openai_vision(
-    api_key: str, b64_image: str, prompt: str, configured_model: str | None = None
-) -> str | None:
+async def _openai_vision(api_key: str, b64_image: str, prompt: str, configured_model: str | None = None) -> str | None:
     """Call OpenAI Vision API."""
     import httpx
 
@@ -646,19 +649,22 @@ async def _openai_vision(
     endpoint = "https://api.openai.com/v1/chat/completions"
     try:
         from pilot.models.cloud import PROVIDER_ENDPOINTS
+
         endpoint = PROVIDER_ENDPOINTS.get("openai", endpoint)
     except Exception:
         pass
 
     payload = {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
-            ],
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+                ],
+            }
+        ],
         "max_tokens": 1000,
     }
 
@@ -669,7 +675,7 @@ async def _openai_vision(
                 if resp.status_code == 200:
                     return resp.json()["choices"][0]["message"]["content"]
                 elif resp.status_code in (429, 503):
-                    wait = 2.0 * (2 ** attempt)
+                    wait = 2.0 * (2**attempt)
                     logger.info("OpenAI returned %d, retrying in %.1fs", resp.status_code, wait)
                     await asyncio.sleep(wait)
                     continue
@@ -681,9 +687,8 @@ async def _openai_vision(
                 return None
     return None
 
-async def _claude_vision(
-    api_key: str, b64_image: str, prompt: str, configured_model: str | None = None
-) -> str | None:
+
+async def _claude_vision(api_key: str, b64_image: str, prompt: str, configured_model: str | None = None) -> str | None:
     """Call Anthropic Claude Vision API."""
     import httpx
 
@@ -691,6 +696,7 @@ async def _claude_vision(
     endpoint = "https://api.anthropic.com/v1/messages"
     try:
         from pilot.models.cloud import PROVIDER_ENDPOINTS
+
         endpoint = PROVIDER_ENDPOINTS.get("claude", endpoint)
     except Exception:
         pass
@@ -698,13 +704,15 @@ async def _claude_vision(
     payload = {
         "model": model,
         "max_tokens": 1000,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
-                {"type": "text", "text": prompt},
-            ],
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
@@ -717,12 +725,12 @@ async def _claude_vision(
                         "x-api-key": api_key,
                         "anthropic-version": "2023-06-01",
                         "content-type": "application/json",
-                    }
+                    },
                 )
                 if resp.status_code == 200:
                     return resp.json()["content"][0]["text"]
                 elif resp.status_code in (429, 529):
-                    wait = 2.0 * (2 ** attempt)
+                    wait = 2.0 * (2**attempt)
                     logger.info("Claude returned %d, retrying in %.1fs", resp.status_code, wait)
                     await asyncio.sleep(wait)
                     continue
