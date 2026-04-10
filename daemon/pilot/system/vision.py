@@ -127,7 +127,8 @@ async def screen_ocr(
 
     # ── All engines failed ───────────────────────────────────────────
     install_hint = _get_install_hint()
-    raise RuntimeError(f"No OCR engine could extract text.\nTried: {'; '.join(errors)}\nTo fix: {install_hint}")
+    logger.warning("No OCR engine available.")
+    return f"[OCR unavailable on this system. Tried: {'; '.join(errors)}. To fix: {install_hint}]"
 
 
 def _get_install_hint() -> str:
@@ -481,36 +482,257 @@ async def screen_analyze(
     prompt: str = "Describe what you see on the screen",
     region: tuple[int, int, int, int] | None = None,
 ) -> str:
-    """Analyze the screen using a vision-capable LLM."""
+    """Analyze the screen using a vision-capable LLM.
+
+    Priority: Cloud Vision (Gemini/OpenAI/Claude) → Local Ollama → OCR fallback.
+    Includes retry logic for transient 503/429 errors.
+    """
     img_bytes = await _capture_screenshot_bytes(region)
     b64_image = base64.b64encode(img_bytes).decode("utf-8")
 
-    # Try Ollama with vision model
+    import httpx
+
+    cloud_errors: list[str] = []
+
+    # ── 1. Cloud Vision (Gemini / OpenAI / Claude) ───────────────────
     try:
-        import httpx
+        from pilot.config import PilotConfig
+        from pilot.security.vault import KeyVault
+
+        config = PilotConfig.load()
+        if config.model.provider == "cloud" and config.model.cloud_provider:
+            vault = KeyVault(config)
+            api_key = await vault.get_key(config.model.cloud_provider)
+            if api_key:
+                provider = config.model.cloud_provider
+
+                if provider == "gemini":
+                    result = await _gemini_vision(api_key, b64_image, prompt, config.model.cloud_model)
+                    if result is not None:
+                        return result
+                    cloud_errors.append("Gemini Vision: all models returned errors")
+
+                elif provider == "openai":
+                    result = await _openai_vision(api_key, b64_image, prompt, config.model.cloud_model)
+                    if result is not None:
+                        return result
+                    cloud_errors.append("OpenAI Vision: request failed")
+
+                elif provider == "claude":
+                    result = await _claude_vision(api_key, b64_image, prompt, config.model.cloud_model)
+                    if result is not None:
+                        return result
+                    cloud_errors.append("Claude Vision: request failed")
+
+                else:
+                    cloud_errors.append(f"Unsupported cloud provider for vision: {provider}")
+            else:
+                cloud_errors.append(f"No API key stored for {config.model.cloud_provider}")
+    except Exception as e:
+        cloud_errors.append(f"Cloud vision init error: {e}")
+        logger.warning("Cloud vision exception: %s", e)
+
+    # ── 2. Local Ollama with vision models ───────────────────────────
+    try:
+        ollama_url = "http://127.0.0.1:11434"
+        try:
+            from pilot.config import PilotConfig
+            ollama_url = PilotConfig.load().model.ollama_base_url or ollama_url
+        except Exception:
+            pass
 
         async with httpx.AsyncClient(timeout=60) as client:
-            for model in ["llava:7b", "llava", "bakllava", "moondream"]:
+            for model_name in ["llava:7b", "llava", "bakllava", "moondream"]:
                 try:
                     resp = await client.post(
-                        "http://127.0.0.1:11434/api/generate",
-                        json={
-                            "model": model,
-                            "prompt": prompt,
-                            "images": [b64_image],
-                            "stream": False,
-                        },
+                        f"{ollama_url}/api/generate",
+                        json={"model": model_name, "prompt": prompt, "images": [b64_image], "stream": False},
                     )
                     if resp.status_code == 200:
                         return resp.json().get("response", "No response")
                 except Exception:
                     continue
+    except Exception:
+        pass
 
-        # Fallback: just do OCR and describe
+    # ── 3. Fallback: OCR text dump ───────────────────────────────────
+    try:
         ocr_text = await screen_ocr(region)
-        return f"[Vision model not available — falling back to OCR]\nScreen text content:\n{ocr_text[:2000]}"
-    except Exception as e:
-        return f"Screen analysis failed: {e}"
+        if ocr_text and not ocr_text.startswith("[OCR unavailable"):
+            return f"[Vision model not available — falling back to OCR]\nScreen text content:\n{ocr_text[:2000]}"
+    except Exception:
+        pass
+
+    # ── All methods failed — return actionable error ─────────────────
+    detail = "; ".join(cloud_errors) if cloud_errors else "No cloud provider configured"
+    return (
+        f"[Screen analysis unavailable. {detail}. "
+        f"Local Ollama vision models not found. OCR also unavailable. "
+        f"Please check your API key in Settings or install a local vision model.]"
+    )
+
+
+async def _gemini_vision(
+    api_key: str, b64_image: str, prompt: str, configured_model: str | None = None
+) -> str | None:
+    """Call Gemini Vision API with model fallback and retry on 503/429."""
+    import httpx
+
+    models_to_try = []
+    primary = configured_model or "gemini-2.5-flash"
+    models_to_try.append(primary)
+    # Add fallbacks that are different from the primary
+    for fallback in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        if fallback not in models_to_try:
+            models_to_try.append(fallback)
+
+    base_url = "https://generativelanguage.googleapis.com/v1beta"
+    try:
+        from pilot.models.cloud import PROVIDER_ENDPOINTS
+        base_url = PROVIDER_ENDPOINTS.get("gemini", base_url)
+    except Exception:
+        pass
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inlineData": {"mimeType": "image/png", "data": b64_image}},
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1},
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        for model_name in models_to_try:
+            endpoint = f"{base_url}/models/{model_name}:generateContent?key={api_key}"
+            # Retry up to 2 times on transient errors (503, 429)
+            for attempt in range(3):
+                try:
+                    resp = await client.post(endpoint, json=payload)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                return parts[0].get("text", "")
+                        logger.warning("Gemini returned empty candidates for %s", model_name)
+                        break  # Try next model
+                    elif resp.status_code in (429, 503):
+                        wait = 2.0 * (2 ** attempt)
+                        logger.info(
+                            "Gemini %s returned %d, retrying in %.1fs (attempt %d/3)",
+                            model_name, resp.status_code, wait, attempt + 1,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    else:
+                        logger.warning("Gemini %s failed: %d %s", model_name, resp.status_code, resp.text[:150])
+                        break  # Try next model
+                except Exception as e:
+                    logger.warning("Gemini %s request error: %s", model_name, e)
+                    break
+    return None
+
+
+async def _openai_vision(
+    api_key: str, b64_image: str, prompt: str, configured_model: str | None = None
+) -> str | None:
+    """Call OpenAI Vision API."""
+    import httpx
+
+    model = configured_model or "gpt-4o"
+    endpoint = "https://api.openai.com/v1/chat/completions"
+    try:
+        from pilot.models.cloud import PROVIDER_ENDPOINTS
+        endpoint = PROVIDER_ENDPOINTS.get("openai", endpoint)
+    except Exception:
+        pass
+
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+            ],
+        }],
+        "max_tokens": 1000,
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        for attempt in range(3):
+            try:
+                resp = await client.post(endpoint, json=payload, headers={"Authorization": f"Bearer {api_key}"})
+                if resp.status_code == 200:
+                    return resp.json()["choices"][0]["message"]["content"]
+                elif resp.status_code in (429, 503):
+                    wait = 2.0 * (2 ** attempt)
+                    logger.info("OpenAI returned %d, retrying in %.1fs", resp.status_code, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    logger.warning("OpenAI Vision failed: %d %s", resp.status_code, resp.text[:150])
+                    return None
+            except Exception as e:
+                logger.warning("OpenAI request error: %s", e)
+                return None
+    return None
+
+async def _claude_vision(
+    api_key: str, b64_image: str, prompt: str, configured_model: str | None = None
+) -> str | None:
+    """Call Anthropic Claude Vision API."""
+    import httpx
+
+    model = configured_model or "claude-3-5-sonnet-20241022"
+    endpoint = "https://api.anthropic.com/v1/messages"
+    try:
+        from pilot.models.cloud import PROVIDER_ENDPOINTS
+        endpoint = PROVIDER_ENDPOINTS.get("claude", endpoint)
+    except Exception:
+        pass
+
+    payload = {
+        "model": model,
+        "max_tokens": 1000,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        for attempt in range(3):
+            try:
+                resp = await client.post(
+                    endpoint,
+                    json=payload,
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    }
+                )
+                if resp.status_code == 200:
+                    return resp.json()["content"][0]["text"]
+                elif resp.status_code in (429, 529):
+                    wait = 2.0 * (2 ** attempt)
+                    logger.info("Claude returned %d, retrying in %.1fs", resp.status_code, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    logger.warning("Claude Vision failed: %d %s", resp.status_code, resp.text[:150])
+                    return None
+            except Exception as e:
+                logger.warning("Claude request error: %s", e)
+                return None
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────

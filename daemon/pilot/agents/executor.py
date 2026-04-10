@@ -1212,8 +1212,9 @@ class Executor:
     async def _exec_screen_analyze(self, action: Action) -> str:
         from pilot.system.vision import screen_analyze
 
-        p: ScreenVisionParams = action.parameters  # type: ignore[assignment]
-        return await screen_analyze(p.prompt)
+        # Defensive: handle both ScreenVisionParams and ScreenshotParams gracefully
+        prompt = getattr(action.parameters, "prompt", None) or "Describe what you see on the screen"
+        return await screen_analyze(prompt)
 
     async def _exec_screen_element_map(self, action: Action) -> str:
         from pilot.system.vision import screen_element_map

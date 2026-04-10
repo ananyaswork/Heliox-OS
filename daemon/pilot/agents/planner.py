@@ -351,7 +351,9 @@ class Planner:
                     Action(
                         action_type=ActionType.SCREEN_ANALYZE,
                         target="screen",
-                        parameters=ScreenshotParams(),
+                        parameters=ScreenVisionParams(
+                            prompt="Describe what you see on the screen",
+                        ),
                     )
                 ],
                 explanation="Take a screenshot and use vision analysis to describe it",
