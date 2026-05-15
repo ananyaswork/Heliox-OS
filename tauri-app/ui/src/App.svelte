@@ -227,15 +227,25 @@
                 {#if $session.loading}
                   <ExecutionGraph />
                   
-                  <div class="message system">
-                    <div class="msg-header">
-                      <span class="msg-label">HELIOX</span>
-                      <span class="phase-badge">{$session.phase || "thinking"}</span>
+                  {#if $session.streamingText}
+                    <div class="message system streaming">
+                      <div class="msg-header">
+                        <span class="msg-label">HELIOX</span>
+                        <span class="phase-badge">streaming</span>
+                      </div>
+                      <span class="msg-text">{$session.streamingText}</span>
                     </div>
-                    <span class="msg-text loading-dots">
-                      {$session.phase ? `${$session.phase}` : "Thinking"}
-                    </span>
-                  </div>
+                  {:else}
+                    <div class="message system">
+                      <div class="msg-header">
+                        <span class="msg-label">HELIOX</span>
+                        <span class="phase-badge">{$session.phase || "thinking"}</span>
+                      </div>
+                      <span class="msg-text loading-dots">
+                        {$session.phase ? `${$session.phase}` : "Thinking"}
+                      </span>
+                    </div>
+                  {/if}
                 {/if}
               {/snippet}
             </VirtualList>

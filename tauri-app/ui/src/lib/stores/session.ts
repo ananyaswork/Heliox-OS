@@ -62,6 +62,7 @@ interface SessionState {
   liveActions: LiveActionState[];
   totalTokens: number;
   estimatedCost: number;
+  streamingText?: string;
 }
 
 const initialState: SessionState = {
@@ -76,6 +77,7 @@ const initialState: SessionState = {
   liveActions: [],
   totalTokens: 0,
   estimatedCost: 0,
+  streamingText: "",
 };
 
 const MODEL_RATES: Record<string, number> = {
