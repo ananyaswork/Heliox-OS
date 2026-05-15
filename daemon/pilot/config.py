@@ -104,7 +104,6 @@ class PilotConfig:
             try:
                 raw = tomllib.loads(CONFIG_FILE.read_text(encoding="utf-8"))
                 _validate_config_types(raw)
-                _validate_config_types(raw)  # <-- Our new validation check
                 config = _merge_config(config, raw)
             except Exception as e:
                 logger.error(f"Failed to load config.toml: {e}. Falling back to safe defaults.")
