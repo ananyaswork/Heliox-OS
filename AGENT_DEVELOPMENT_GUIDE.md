@@ -1,62 +1,62 @@
-# 🤖 Agent Development Guide — Dynamic Registry
+## 🤖 Agent Development Guide — Dynamic Registry
 
-This guide walks you through how to build and plug in a custom agent into Helix OS using the dynamic registry system introduced in PR #160.
+Welcome to the **Heliox OS** Agent Development Guide! This tutorial walks you through how to build and plug in a custom agent using the new dynamic registry system introduced in PR #160.
 
 ---
 
 ## 📖 Overview
 
-Previously, agents were hardcoded into the orchestrator. With the new dynamic registry, agents **self-register** by declaring their capabilities at startup. The orchestrator dynamically routes actions based on those declared capabilities — no manual wiring needed!
+Heliox OS uses a **dynamic agent registry** that automatically discovers and registers agents at startup. Instead of manually wiring up agents, you simply:
 
-**Key components:**
+1. Subclass `BaseAgent`
+2. Decorate your class with `@auto_register`
+3. Place it in the `pilot/agents/` package
 
-| Component | File | Role |
-|-----------|------|------|
-| `AgentRegistry` | `daemon/pilot/agents/registry.py` | Singleton registry that discovers and stores all agents |
-| `discover_agents()` | `daemon/pilot/agents/registry.py` | Scans the `pilot.agents` package for all `BaseAgent` subclasses |
-| `auto_register` | `daemon/pilot/agents/registry.py` | Decorator to explicitly register an agent class |
-| `BaseAgent` | `daemon/pilot/agents/base_agent.py` | Abstract base class all agents must inherit from |
-| `AgentRole` | `daemon/pilot/agents/base_agent.py` | Enum defining the agent's canonical role |
-| `AgentCapability` | `daemon/pilot/agents/base_agent.py` | Describes one action/tool an agent can perform |
+The registry handles the rest.
 
 ---
 
-## 🏗️ Step 1 — Understand BaseAgent
+## 🧩 Key Components
 
-Every custom agent must inherit from `BaseAgent` and implement **three abstract methods**. Here's the real import pattern used in the codebase:
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| `AgentRegistry` | `pilot/agents/registry.py` | Singleton registry that stores all agents |
+| `BaseAgent` | `pilot/agents/base_agent.py` | Abstract base class all agents must extend |
+| `auto_register` | `pilot/agents/registry.py` | Decorator that registers an agent on import |
+| `discover_agents()` | `pilot/agents/registry.py` | Scans the package and imports all agent modules |
+
+---
+
+## 🚀 Step 1 — Understand the Registry
+
+The `AgentRegistry` is a **singleton** — there's only one instance across the entire application.
 
 ```python
-from __future__ import annotations
+from pilot.agents.registry import AgentRegistry
 
-import logging
-from typing import TYPE_CHECKING, Any
+# Get the single registry instance
+registry = AgentRegistry.get_instance()
 
-from pilot.actions import ActionPlan, ActionResult, ActionType
-from pilot.agents.base_agent import AgentCapability, AgentRole, AgentStatus, BaseAgent
-
-if TYPE_CHECKING:
-    from pilot.models.router import ModelRouter
-
-logger = logging.getLogger("pilot.agents.my_agent")
+# See all registered agents
+all_agents = registry.get_all_agents()  # returns dict[str, type[BaseAgent]]
+print(all_agents)
 ```
 
-The three abstract methods you **must** implement:
+At startup, `discover_agents()` is called to scan the `pilot.agents` package and import every module, which triggers the `@auto_register` decorator on each agent class.
 
-| Method | Returns | Purpose |
-|--------|---------|---------|
-| `get_capabilities()` | `list[AgentCapability]` | Declares what actions this agent can handle |
-| `get_system_prompt()` | `str` | The LLM system prompt for this agent |
-| `handle_task()` | `list[ActionResult]` | Executes the actual task logic |
+```python
+from pilot.agents.registry import discover_agents
+
+discover_agents(package_name="pilot.agents")
+```
 
 ---
 
 ## 🔧 Step 2 — Create Your Custom Agent
 
-Create a new file in `daemon/pilot/agents/`. For example: `my_agent.py`
+Here's a complete example of a custom agent. Create a new file in `daemon/pilot/agents/`, for example `my_agent.py`:
 
 ```python
-from __future__ import annotations
-
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -71,160 +71,114 @@ logger = logging.getLogger("pilot.agents.my_agent")
 
 # Define the action types this agent handles
 MY_ACTION_TYPES: set[ActionType] = {
-    ActionType.FILE,  # replace with the relevant ActionType(s)
+    ActionType.FILE_READ,  # replace with the relevant ActionType(s)
 }
 
 @auto_register
 class MyAgent(BaseAgent):
     """Specialist agent for handling my specific domain."""
 
-    def __init__(self, model_router: ModelRouter) -> None:
+    def __init__(self, model_router: "ModelRouter") -> None:
         super().__init__(role=AgentRole.GENERAL, model_router=model_router)
 
     def get_capabilities(self) -> list[AgentCapability]:
         return [
             AgentCapability(
-                action_type=ActionType.FILE,
-                description="Reads and processes files in my domain",
-            ),
+                action_type=ActionType.FILE_READ,
+                description="Handles file reading tasks",
+                requires_sandbox=False,
+            )
         ]
 
     def get_system_prompt(self) -> str:
         return (
-            "You are a specialist agent for handling my specific domain. "
-            "Execute tasks carefully and return structured results."
+            "You are a specialist agent. Your job is to handle "
+            "file reading and related tasks efficiently."
         )
+
+    def get_resource_needs(self) -> set[str]:
+        return {"filesystem"}
 
     def can_handle(self, action_type: ActionType) -> bool:
         return action_type in MY_ACTION_TYPES
 
-    async def handle_task(
-        self,
-        user_input: str,
-        plan: ActionPlan,
-        context: dict[str, Any] | None = None,
-    ) -> list[ActionResult]:
-        """Execute actions that fall within this agent's domain."""
-        my_actions = [a for a in plan.actions if self.can_handle(a.action_type)]
-
-        if not my_actions:
-            self.status = AgentStatus.IDLE
-            return []
-
+    async def handle_task(self, action_plan: ActionPlan, **kwargs: Any) -> ActionResult:
         self.status = AgentStatus.BUSY
-        results = []
+        logger.info("MyAgent handling task: %s", action_plan.action_type)
 
-        for action in my_actions:
-            # Your action logic here
-            result = ActionResult(
-                action=action,
-                success=True,
-                output=f"Handled: {action}",
-            )
-            results.append(result)
+        try:
+            # Your task logic goes here
+            result_data = {"message": "Task completed successfully"}
 
-        self.status = AgentStatus.IDLE
-        return results
+            self.status = AgentStatus.IDLE
+            return ActionResult(success=True, data=result_data)
 
-    def get_permission_tier(self) -> int:
-        return 1  # Safe, read-only
-
-    def get_resource_needs(self) -> set[str]:
-        return {"file_system"}
+        except Exception as exc:
+            logger.exception("MyAgent failed: %s", exc)
+            self.status = AgentStatus.IDLE
+            return ActionResult(success=False, error=str(exc))
 ```
-
-> **Note:** The `@auto_register` decorator registers your agent with `AgentRegistry` automatically when the module is imported — no manual wiring needed!
 
 ---
 
-## 🔍 Step 3 — How the Registry Works
+## ✅ Step 3 — Verify Registration
 
-`AgentRegistry` is a **singleton** — one shared instance across the entire system.
+After creating your agent, you can verify it was registered correctly:
 
 ```python
-from pilot.agents.registry import AgentRegistry
+from pilot.agents.registry import AgentRegistry, discover_agents
 
-# Get the singleton instance
+# Trigger discovery (done automatically at startup)
+discover_agents(package_name="pilot.agents")
+
 registry = AgentRegistry.get_instance()
+all_agents = registry.get_all_agents()
 
-# Auto-discover all BaseAgent subclasses in the pilot.agents package
-AgentRegistry.discover_agents()
-
-# Get all registered agents (returns dict[str, type[BaseAgent]])
-all_agents = AgentRegistry.get_all_agents()
-for name, agent_class in all_agents.items():
-    print(f"Agent: {name} → {agent_class}")
-
-# Get a specific agent class by name
-agent_class = AgentRegistry.get_agent_class("my_agent")
-
-# Create an agent instance
-agent = AgentRegistry.create_agent("my_agent", model_router=model_router)
+print("MyAgent" in all_agents)  # True
 ```
 
----
-
-## ✅ Step 4 — Verify Your Agent is Registered
+For testing, you can reset the registry:
 
 ```python
-from pilot.agents.registry import AgentRegistry
-
-AgentRegistry.discover_agents()
-agents = AgentRegistry.get_all_agents()
-
-print(f"Total agents found: {len(agents)}")
-for name in agents:
-    print(f"  ✅ {name}")
+AgentRegistry.clear()  # Clears all registered agents
 ```
 
 ---
 
-## 🛡️ Permission Tiers Reference
+## 🛡️ Step 4 — Permission Tiers
 
-| Tier | Level | Examples |
-|------|-------|---------|
-| **Tier 1** | Safe / Read-only | Reading files, fetching web content |
-| **Tier 2** | Requires confirmation | Writing files, sending messages |
-| **Tier 3** | Destructive | Deleting files, system changes |
-| **Tier 4** | Critical | Recursive deletes, system-level ops |
-| **Tier 5** | Root-level | Requires explicit root permission |
+Heliox OS enforces a **five-tier permission system**. Make sure your agent requests only the permissions it actually needs:
 
-> Always use the **lowest tier** that your agent actually needs.
+| Tier | Description | Example Use Case |
+|------|-------------|-----------------|
+| 0 | Read-only, sandboxed | Summarisation, analysis |
+| 1 | Read + limited write | File creation in temp dirs |
+| 2 | Full filesystem access | Refactoring, build tools |
+| 3 | Network + system calls | API integrations, scrapers |
+| 4 | Unrestricted | Core system agents only |
+
+Set your agent's permission tier by overriding `get_permission_tier()` in `BaseAgent` if needed.
 
 ---
 
-## 🎭 AgentRole Reference
+## 📂 Related Files
 
-| Role | Value |
-|------|-------|
-| `AgentRole.SYSTEM` | `"system_agent"` |
-| `AgentRole.WEB` | `"web_agent"` |
-| `AgentRole.MONITOR` | `"monitor_agent"` |
-| `AgentRole.COMMUNICATION` | `"comm_agent"` |
-| `AgentRole.ORCHESTRATOR` | `"orchestrator"` |
-| `AgentRole.GENERAL` | `"general"` |
+- `daemon/pilot/agents/registry.py` — Registry and `auto_register` decorator
+- `daemon/pilot/agents/base_agent.py` — `BaseAgent` abstract class
+- `daemon/pilot/agents/code_agent.py` — Real-world example agent
+- `daemon/pilot/agents/orchestrator.py` — Agent orchestration logic
 
 ---
 
 ## 💡 Tips for Contributors
 
-- **Implement all 3 abstract methods** — `get_capabilities()`, `get_system_prompt()`, and `handle_task()` are required
-- **Override `can_handle()`** — use a set of `ActionType` values for clean routing
-- **Use `@auto_register`** — cleanest way to register your agent
-- **Pass the right `AgentRole`** to `super().__init__()` — use `GENERAL` if none fit
-- **Test before submitting** — run `python -m py_compile daemon/pilot/agents/my_agent.py`
-- **Follow naming conventions** — look at `code_agent.py`, `comm_agent.py` for reference
-- **To reset the registry in tests** — use `AgentRegistry.clear()`
+- **One agent per file** — keep each agent in its own module inside `pilot/agents/`
+- **Use `@auto_register`** — don't manually add agents to the registry
+- **Override `can_handle()`** — use a set of `ActionType` values for efficient lookup
+- **Log with the module logger** — use `logging.getLogger("pilot.agents.your_agent")`
+- **Handle exceptions in `handle_task()`** — always return an `ActionResult`, never raise
+- **Request minimal permissions** — only declare the resources your agent truly needs
 
 ---
 
-## 📚 Related Files
-
-- `daemon/pilot/agents/base_agent.py` — Base class, enums, and message types
-- `daemon/pilot/agents/registry.py` — Dynamic registry implementation
-- `daemon/pilot/agents/orchestrator.py` — Routes actions to agents
-- `daemon/pilot/agents/code_agent.py` — Real example of an agent implementation
-
----
-
-*This guide was created as part of GSSoC 2026 contributions to Helix OS.*
+*This guide covers the dynamic registry introduced in PR #160. For questions, open an issue or check the existing agents in `daemon/pilot/agents/` for reference.*
